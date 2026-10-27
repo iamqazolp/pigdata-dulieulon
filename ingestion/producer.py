@@ -19,10 +19,14 @@ async def ensure_topic(bootstrap: str, topic: str = TOPIC, partitions: int = PAR
     admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap)
     await admin.start()
     try:
-        await admin.create_topics([NewTopic(topic, num_partitions=partitions, replication_factor=1)])
-        log.info("created topic %s with %d partitions", topic, partitions)
-    except TopicAlreadyExistsError:
-        pass
+        if topic in await admin.list_topics():
+            return
+        response = await admin.create_topics([NewTopic(topic, num_partitions=partitions, replication_factor=1)])
+        _, code, *_ = response.topic_errors[0]
+        if code == 0:
+            log.info("created topic %s with %d partitions", topic, partitions)
+        elif code != TopicAlreadyExistsError.errno:
+            raise RuntimeError(f"create_topics {topic} failed with error code {code}")
     finally:
         await admin.close()
 
