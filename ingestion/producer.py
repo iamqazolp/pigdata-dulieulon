@@ -15,6 +15,10 @@ PARTITIONS = 3
 log = logging.getLogger(__name__)
 
 
+def partition_key(event: Event) -> bytes:
+    return (event.event_id if event.source == "binance" else event.sender).encode()
+
+
 async def ensure_topic(bootstrap: str, topic: str = TOPIC, partitions: int = PARTITIONS) -> None:
     admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap)
     await admin.start()
@@ -48,7 +52,7 @@ class EventProducer:
 
     async def send(self, events: Iterable[Event]) -> None:
         for event in events:
-            await self._producer.send(self.topic, key=event.sender.encode(), value=event.to_json())
+            await self._producer.send(self.topic, key=partition_key(event), value=event.to_json())
             self.sent += 1
             if self.sent % 1000 == 0:
                 log.info("sent %d events", self.sent)

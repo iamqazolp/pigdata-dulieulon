@@ -1,13 +1,16 @@
 import asyncio
+from collections import Counter
 import copy
 import csv
 import json
 from pathlib import Path
+import random
 
 import pytest
 
+from ingestion.producer import partition_key
 from ingestion.schema import Event
-from ingestion.sources import binance, blockchain, paysim
+from ingestion.sources import binance, blockchain, injector, paysim
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -137,3 +140,141 @@ def test_event_from_json_rejects_missing_fields():
     del payload["sender"]
     with pytest.raises(ValueError):
         Event.from_json(json.dumps(payload))
+
+
+def test_partition_key_uses_event_id_for_binance_and_sender_otherwise():
+    bn = Event("binance:BTCUSDT:1", 1000, "binance", "BTCUSDT", "BTCUSDT", 100.0, 68000.0, "trade_buy")
+    bc = Event("blockchain:abc:0", 1000, "blockchain", "bc1qsender", "bc1qrecv", 0.5, None, "transfer")
+    ps = Event("paysim:0", 1000, "paysim", "C100", "M200", 50.0, None, "PAYMENT")
+    inj = Event("injector:burst:1:0", 1000, "injector", "bc1qfraud", "bc1qout", 0.2, None, "transfer", True, "burst")
+    assert partition_key(bn) == b"binance:BTCUSDT:1"
+    assert partition_key(bc) == b"bc1qsender"
+    assert partition_key(ps) == b"C100"
+    assert partition_key(inj) == b"bc1qfraud"
+
+
+def test_injector_large_amount_invariants():
+    rng = random.Random(101)
+    now_ms = 1_792_665_700_000
+    seen_types = set()
+    for _ in range(30):
+        events = injector.generate_incident("large_amount", rng, now_ms)
+        assert len(events) == 1
+        e = events[0]
+        assert Event.from_json(e.to_json()) == e
+        assert e.source == "injector"
+        assert e.is_injected is True
+        assert e.fraud_pattern == "large_amount"
+        assert e.timestamp == now_ms
+        seen_types.add(e.type)
+        if e.type == "transfer":
+            assert e.price is None
+            assert e.sender.startswith("bc1q") and e.receiver.startswith("bc1q")
+            assert e.sender != e.receiver
+            assert 25.0 <= e.amount <= 150.0
+        else:
+            assert e.type in ("trade_buy", "trade_sell")
+            assert e.sender == e.receiver
+            assert e.sender.lower() in binance.DEFAULT_SYMBOLS
+            assert e.price is not None and e.price > 0
+            assert 75_000.0 <= e.amount <= 250_000.0
+    assert "transfer" in seen_types
+    assert seen_types & {"trade_buy", "trade_sell"}
+
+
+def test_injector_burst_invariants():
+    rng = random.Random(202)
+    now_ms = 1_792_665_700_000
+    events = injector.generate_incident("burst", rng, now_ms)
+    assert 15 <= len(events) <= 25
+    senders = {e.sender for e in events}
+    receivers = [e.receiver for e in events]
+    assert len(senders) == 1
+    sender = next(iter(senders))
+    assert sender.startswith("bc1q")
+    assert len(set(receivers)) == len(events)
+    assert sender not in receivers
+    assert events[0].timestamp == now_ms
+    for i, e in enumerate(events):
+        assert Event.from_json(e.to_json()) == e
+        assert e.source == "injector"
+        assert e.is_injected is True
+        assert e.fraud_pattern == "burst"
+        assert e.type == "transfer"
+        assert e.price is None
+        assert e.receiver.startswith("bc1q")
+        assert 0.05 <= e.amount <= 0.8
+        if i > 0:
+            assert 50 <= e.timestamp - events[i - 1].timestamp <= 300
+
+
+def test_injector_smurfing_invariants():
+    rng = random.Random(303)
+    now_ms = 1_792_665_700_000
+    events = injector.generate_incident("smurfing", rng, now_ms)
+    assert 8 <= len(events) <= 12
+    senders = {e.sender for e in events}
+    receivers = [e.receiver for e in events]
+    assert len(senders) == 1
+    sender = next(iter(senders))
+    assert sender.startswith("bc1q")
+    assert len(set(receivers)) == len(events)
+    assert sender not in receivers
+    for e in events:
+        assert Event.from_json(e.to_json()) == e
+        assert e.source == "injector"
+        assert e.is_injected is True
+        assert e.fraud_pattern == "smurfing"
+        assert e.timestamp == now_ms
+        assert e.type == "transfer"
+        assert e.price is None
+        assert e.receiver.startswith("bc1q")
+        assert 0.08 <= e.amount <= 0.095
+
+
+def test_injector_rapid_relay_invariants():
+    rng = random.Random(404)
+    now_ms = 1_792_665_700_000
+    events = injector.generate_incident("rapid_relay", rng, now_ms)
+    assert 4 <= len(events) <= 6
+    assert 5.0 <= events[0].amount <= 25.0
+    assert events[0].timestamp == now_ms
+    for i, e in enumerate(events):
+        assert Event.from_json(e.to_json()) == e
+        assert e.source == "injector"
+        assert e.is_injected is True
+        assert e.fraud_pattern == "rapid_relay"
+        assert e.type == "transfer"
+        assert e.price is None
+        assert e.sender.startswith("bc1q") and e.receiver.startswith("bc1q")
+        assert e.sender != e.receiver
+        if i > 0:
+            prev = events[i - 1]
+            assert prev.receiver == e.sender
+            assert 200 <= e.timestamp - prev.timestamp <= 800
+            assert e.amount < prev.amount
+            assert 0.985 <= e.amount / prev.amount <= 0.995
+
+
+def test_injector_stream_produces_balanced_pattern_shares():
+    async def take_incidents(n: int):
+        out = []
+        gen = injector.stream(rate=1000, seed=42)
+        try:
+            async for batch in gen:
+                out.extend(batch)
+                n -= 1
+                if n <= 0:
+                    break
+        finally:
+            await gen.aclose()
+        return out
+
+    events = asyncio.run(take_incidents(200))
+    counts = Counter(e.fraud_pattern for e in events)
+    assert set(counts) == set(injector.PATTERNS)
+    total = len(events)
+    for name, spec in injector.PATTERNS.items():
+        share = counts[name] / total
+        assert abs(share - spec.event_share) < 0.12
+
