@@ -9,14 +9,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from aiokafka import AIOKafkaConsumer
 
-from ingestion.producer import TOPIC
+from ingestion.producer import TOPIC, partition_key
 from ingestion.schema import Event
 
 
-async def consume(bootstrap: str, n: int, timeout: float, to_end: bool) -> tuple[Counter, list[str]]:
+async def consume(bootstrap: str, n: int, timeout: float, to_end: bool) -> tuple[Counter, Counter, list[str]]:
     consumer = AIOKafkaConsumer(TOPIC, bootstrap_servers=bootstrap, auto_offset_reset="earliest", enable_auto_commit=False)
     await consumer.start()
     counts: Counter = Counter()
+    patterns: Counter = Counter()
     errors: list[str] = []
     try:
         loop = asyncio.get_running_loop()
@@ -38,14 +39,17 @@ async def consume(bootstrap: str, n: int, timeout: float, to_end: bool) -> tuple
                 for record in records:
                     try:
                         event = Event.from_json(record.value)
-                        if record.key.decode() != event.sender:
-                            raise ValueError(f"key {record.key!r} != sender {event.sender!r}")
+                        expected_key = partition_key(event)
+                        if record.key != expected_key:
+                            raise ValueError(f"key {record.key!r} != expected {expected_key!r}")
                         counts[event.source] += 1
+                        if event.is_injected:
+                            patterns[event.fraud_pattern or "unknown"] += 1
                     except Exception as exc:
                         errors.append(f"partition {record.partition} offset {record.offset}: {exc!r}")
     finally:
         await consumer.stop()
-    return counts, errors
+    return counts, patterns, errors
 
 
 def main() -> int:
@@ -57,11 +61,15 @@ def main() -> int:
     p.add_argument("--bootstrap", default=os.environ.get("KAFKA_BOOTSTRAP", "localhost:19092"))
     args = p.parse_args()
 
-    counts, errors = asyncio.run(consume(args.bootstrap, args.n, args.timeout, args.to_end))
+    counts, patterns, errors = asyncio.run(consume(args.bootstrap, args.n, args.timeout, args.to_end))
     total = sum(counts.values()) + len(errors)
     print(f"consumed {total} messages from {TOPIC}")
     for source, count in sorted(counts.items()):
         print(f"  {source}: {count}")
+    if patterns:
+        print(f"injected: {sum(patterns.values())}")
+        for pattern, count in sorted(patterns.items()):
+            print(f"  fraud_pattern={pattern}: {count}")
     for err in errors[:10]:
         print(f"INVALID {err}")
     missing = [s for s in args.require if counts[s] == 0]
