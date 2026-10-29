@@ -5,7 +5,12 @@ from typing import AsyncIterator, List, Sequence
 from ingestion.schema import Event
 from ingestion.sources.ws import messages
 
-DEFAULT_SYMBOLS = ("btcusdt", "ethusdt", "bnbusdt", "solusdt", "xrpusdt")
+DEFAULT_SYMBOLS = (
+    "btcusdt", "ethusdt", "bnbusdt", "solusdt", "xrpusdt",
+    "dogeusdt", "adausdt", "trxusdt", "avaxusdt", "linkusdt",
+    "ltcusdt", "suiusdt", "nearusdt", "uniusdt", "aaveusdt",
+    "zecusdt", "pepeusdt", "wldusdt", "enausdt", "taousdt",
+)
 HOSTS = ("wss://stream.binance.com:9443", "wss://data-stream.binance.vision")
 
 
